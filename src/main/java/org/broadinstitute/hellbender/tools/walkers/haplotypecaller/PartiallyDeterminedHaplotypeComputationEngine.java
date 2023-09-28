@@ -111,7 +111,8 @@ public class PartiallyDeterminedHaplotypeComputationEngine {
         List<List<Event>> disallowedCombinations = smithWatermanRealignPairsOfVariantsForEquivalentEvents(referenceHaplotype, aligner, args.getHaplotypeToReferenceSWParameters(), debug, eventsInOrder);
         dragenDisallowedGroupsMessage(referenceHaplotype.getStart(), debug, disallowedCombinations);
 
-        final List<EventGroup> eventGroups = getEventGroupClusters(eventsInOrder, disallowedCombinations);
+        // TODO: add in command line argument to activate joint detection and only use the STR overlap detector if joint detection is turned on
+        final List<EventGroup> eventGroups = getEventGroupClusters(eventsInOrder, disallowedCombinations, Optional.of(strOverlapDetector));
         // if any of our merged event groups is too large, abort.
         if (eventGroups == null) {
             Utils.printIf(debug, () -> "Found event group with too many variants! Aborting haplotype building");
@@ -369,13 +370,16 @@ public class PartiallyDeterminedHaplotypeComputationEngine {
      *                                simplifying via Smith Waterman yields other events
      */
     @VisibleForTesting
-    static List<EventGroup> getEventGroupClusters(List<Event> eventsInOrder, List<List<Event>> swForbiddenPairsAndTrios) {
+    static List<EventGroup> getEventGroupClusters(List<Event> eventsInOrder, List<List<Event>> swForbiddenPairsAndTrios, Optional<OverlapDetector<SimpleInterval>> strIntervals) {
         final List<List<Event>> allMutexes = new ArrayList<>(swForbiddenPairsAndTrios);
 
         // edges due to overlapping position
+        // if STR intervals are given, two events that intersect the same STR are treated as overlapping for the purpose of DRAGEN joint detection
         for (int e1 = 0; e1 < eventsInOrder.size(); e1++) {
             final Event event1 = eventsInOrder.get(e1);
-            for (int e2 = e1 + 1; e2 < eventsInOrder.size() && eventsInOrder.get(e2).getStart() <= event1.getEnd() + 1; e2++) {
+            final int endOfSTR = !strIntervals.isPresent() ? event1.getStart() : strIntervals.get().getOverlaps(event1).stream().mapToInt(SimpleInterval::getEnd).max().orElse(event1.getStart());
+            final int endOfOverlap = Math.max(event1.getEnd(), endOfSTR) + 1;
+            for (int e2 = e1 + 1; e2 < eventsInOrder.size() && eventsInOrder.get(e2).getStart() <= endOfOverlap; e2++) {
                 final Event event2 = eventsInOrder.get(e2);
                 if (eventsOverlapForPDHapsCode(event1, event2)) {
                     allMutexes.add(List.of(event1, event2));
@@ -383,14 +387,23 @@ public class PartiallyDeterminedHaplotypeComputationEngine {
             }
         }
 
+
         // for each mutex, add edges 0-1, 1-2. . . to put all mutex events in one connected component
         final Graph<Event, DefaultEdge> graph = new SimpleGraph<>(DefaultEdge.class);
         eventsInOrder.forEach(graph::addVertex);
         allMutexes.forEach(mutex -> new IndexRange(0, mutex.size() - 1).forEach(n -> graph.addEdge(mutex.get(n), mutex.get(n+1))));
 
+
+
         final List<Set<Event>> components = new ConnectivityInspector<>(graph).connectedSets();
         return components.stream().anyMatch(comp -> comp.size() > MAX_VAR_IN_EVENT_GROUP) ? null :
                 components.stream().map(component -> new EventGroup(component, allMutexes)).toList();
+    }
+
+    // same as above without the STR overlap detector
+    @VisibleForTesting
+    static List<EventGroup> getEventGroupClusters(List<Event> eventsInOrder, List<List<Event>> swForbiddenPairsAndTrios) {
+        return getEventGroupClusters(eventsInOrder, swForbiddenPairsAndTrios, Optional.empty());
     }
 
     /**
